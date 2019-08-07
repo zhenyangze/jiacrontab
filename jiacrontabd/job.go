@@ -148,7 +148,7 @@ func (p *process) exec() error {
 			user:             p.jobEntry.detail.WorkUser,
 			env:              p.jobEntry.detail.WorkEnv,
 			content:          p.jobEntry.logContent,
-			logPath:          p.jobEntry.logPath,
+			logPath:          p.jobEntry.getLogPath(),
 			label:            p.jobEntry.detail.Name,
 			killChildProcess: p.jobEntry.detail.KillChildProcess,
 			jd:               p.jobEntry.jd,
@@ -181,7 +181,6 @@ type JobEntry struct {
 	pc          int32
 	wg          util.WaitGroupWrapper
 	logContent  []byte
-	logPath     string
 	jd          *Jiacrontabd
 	IDChan      chan uint32
 	IDGenerator uint32
@@ -197,9 +196,12 @@ func newJobEntry(job *crontab.Job, jd *Jiacrontabd) *JobEntry {
 		job:       job,
 		IDChan:    make(chan uint32, 10000),
 		processes: make(map[uint32]*process),
-		logPath:   filepath.Join(jd.getOpts().LogPath, "crontab_task", time.Now().Format("2006/01/02"), fmt.Sprintf("%d.log", job.ID)),
 		jd:        jd,
 	}
+}
+
+func (j *JobEntry) getLogPath() string {
+	return filepath.Join(j.jd.getOpts().LogPath, "crontab_task", time.Now().Format("2006/01/02"), fmt.Sprintf("%d.log", j.job.ID))
 }
 
 func (j *JobEntry) setOnce(v bool) {
@@ -228,7 +230,7 @@ func (j *JobEntry) putID(id uint32) {
 }
 
 func (j *JobEntry) writeLog() {
-	writeFile(j.logPath, &j.logContent)
+	writeFile(j.getLogPath(), &j.logContent)
 }
 
 func (j *JobEntry) handleDepError(startTime time.Time, p *process) {
@@ -387,6 +389,13 @@ func (j *JobEntry) exec() {
 		}
 
 		if !j.once {
+
+			// 忽略一秒内重复执行的job
+			if j.detail.LastExecTime.Truncate(time.Second).Equal(time.Now().Truncate(time.Second)) {
+				log.Infof("ignore repeat job %s", j.detail.Name)
+				return
+			}
+
 			if !j.detail.NextExecTime.Truncate(time.Second).Equal(j.job.GetNextExecTime().Truncate(time.Second)) {
 				log.Errorf("%s(%d) JobEntry.exec time error(%s not equal %s)",
 					j.detail.Name, j.detail.ID, j.detail.NextExecTime, j.job.GetNextExecTime())
@@ -398,14 +407,14 @@ func (j *JobEntry) exec() {
 					Day:     j.detail.TimeArgs.Day,
 					Month:   j.detail.TimeArgs.Month,
 					Weekday: j.detail.TimeArgs.Weekday,
-				})
+				}, false)
 				return
 			}
-			j.jd.addJob(j.job)
+			j.jd.addJob(j.job, true)
 		}
 
 		if atomic.LoadInt32(&j.processNum) >= int32(j.detail.MaxConcurrent) && j.detail.MaxConcurrent != 0 {
-			j.logContent = []byte("不得超过job最大并发数量")
+			j.logContent = []byte("不得超过job最大并发数量\n")
 			return
 		}
 
@@ -468,7 +477,6 @@ func (j *JobEntry) updateJob(status models.JobStatus, startTime, endTime time.Ti
 	data := map[string]interface{}{
 		"status":           status,
 		"process_num":      atomic.LoadInt32(&j.processNum),
-		"last_exec_time":   j.job.GetLastExecTime(),
 		"last_exit_status": "",
 		"failed":           false,
 	}
@@ -476,14 +484,6 @@ func (j *JobEntry) updateJob(status models.JobStatus, startTime, endTime time.Ti
 	if endTime.After(startTime) {
 		data["last_cost_time"] = endTime.Sub(startTime).Seconds()
 	}
-
-	// if j.once && (status == models.StatusJobRunning) {
-	// 	data["process_num"] = gorm.Expr("process_num + ?", 1)
-	// }
-
-	// if j.once && (status == models.StatusJobTiming) {
-	// 	data["process_num"] = gorm.Expr("process_num - ?", 1)
-	// }
 
 	var errMsg string
 	if err != nil {
@@ -493,7 +493,6 @@ func (j *JobEntry) updateJob(status models.JobStatus, startTime, endTime time.Ti
 	}
 
 	if j.once {
-		delete(data, "last_exec_time")
 		delete(data, "status")
 		delete(data, "last_exit_status")
 	}
